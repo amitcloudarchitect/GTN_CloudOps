@@ -1,0 +1,11 @@
+.env
+.env.*
+*.tfvars
+!*.tfvars.example
+.terraform/
+terraform.tfstate*
+__pycache__/
+.venv/
+node_modules/
+*.pem
+*.key
