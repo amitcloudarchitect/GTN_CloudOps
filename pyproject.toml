@@ -1,0 +1,60 @@
+[project]
+name = "cloudops-platform"
+version = "0.0.0"
+description = "Getronics CloudOps platform monorepo root"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cloudops-tenancy"]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/tenancy"]
+
+[tool.uv.sources]
+cloudops-tenancy = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "testcontainers[postgres]>=4.8",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["packages", "tools"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+addopts = "--strict-markers --import-mode=importlib"
+markers = [
+    "isolation: cross-tenant isolation case; a release gate (run with -m isolation)",
+    "integration: needs a real PostgreSQL 16 database",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["reference"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "N", "SIM", "RUF", "ASYNC", "PT"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cloudops_tenancy"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101", "S105", "S106", "S608"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+exclude = ["^reference/", "^\\.venv/"]
+explicit_package_bases = true
+mypy_path = "packages/tenancy/src"
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*"]
+ignore_missing_imports = true

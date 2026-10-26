@@ -1,0 +1,255 @@
+"""The single entry point to the platform database.
+
+    db = Database.create(dsn)
+    async with db.transaction(scope) as conn:
+        rows = await conn.execute(select(...))
+
+There is no other way to obtain a connection. The engine is private to this
+module, ``transaction`` is the only method that touches it, and every
+connection it hands out is already inside a transaction with scope applied.
+Outside this package, importing the driver or constructing an engine fails CI
+(``tools/ci/check_data_access.py``).
+
+Defence in depth, in order of strength:
+
+1. The database role must not be able to bypass RLS. Each new physical
+   connection is checked; superuser, BYPASSRLS, or membership of a role that
+   owns tables is refused (``UnsafeDatabaseRoleError``). With RLS ``FORCE``d
+   and an empty scope matching nothing, an unscoped connection sees zero rows.
+2. Scope is applied inside the transaction, transaction-locally.
+3. Application statements cannot change scope or end the transaction
+   (``_guard.check_statement``), and scope is re-verified before commit.
+4. CI rejects any data access path outside this package.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Final, final
+
+from sqlalchemy import event, text
+from sqlalchemy.engine import URL, Connection, CursorResult, Result, make_url
+from sqlalchemy.engine.interfaces import DBAPIConnection, ExecutionContext
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.pool import ConnectionPoolEntry
+from sqlalchemy.sql import Executable
+
+from cloudops_tenancy._guard import check_statement
+from cloudops_tenancy.errors import (
+    ScopeClosedError,
+    ScopeTamperingError,
+    TenancyError,
+    UnsafeDatabaseRoleError,
+)
+from cloudops_tenancy.scope import TenantScope
+
+# Marks the package's own statements so the guard lets them through. Only this
+# module sets it; ScopedConnection offers no way to pass execution options.
+_INTERNAL: Final = "_cloudops_tenancy_internal"
+
+# Why set_config(..., true) and why transaction-local, not session-level:
+#
+# Production reaches PostgreSQL through PgBouncer in *transaction* mode (LLD,
+# Data tier). A server connection belongs to one client only for the length of
+# one transaction, then goes back to the pool and is handed to whichever
+# request — for whichever customer — asks next.
+#
+# A session-level `SET app.tenant_ids = ...` outlives the transaction and stays
+# on that server connection. The next request to land on it inherits customer
+# A's scope; if that request forgets to set its own, or sets it only partly, it
+# reads customer A's data. SQLAlchemy's own pool and pre-ping do not save us:
+# PgBouncer reuses server connections underneath them.
+#
+# `SET LOCAL` lasts until COMMIT or ROLLBACK and then reverts, so scope can
+# never outlive the transaction that set it. `set_config(name, value, true)` is
+# exactly SET LOCAL (the third argument is is_local) in function form, which
+# lets the values travel as bind parameters instead of being spliced into SQL.
+#
+# Never change `true` to `false` here, and never add a plain SET anywhere.
+_APPLY_SCOPE: Final = text(
+    "SELECT set_config('app.tenant_ids', :tenant_ids, true),"
+    "       set_config('app.role', :role, true)"
+)
+
+_READ_SCOPE: Final = text(
+    "SELECT current_setting('app.tenant_ids', true), current_setting('app.role', true)"
+)
+
+# One row: can this login reach a role that bypasses RLS, either directly or by
+# SET ROLE, or that owns a table (owners can ALTER TABLE ... NO FORCE)?
+_ROLE_SAFETY: Final = """
+SELECT
+  EXISTS (SELECT 1 FROM pg_roles r
+          WHERE (r.rolsuper OR r.rolbypassrls)
+            AND pg_has_role(current_user, r.oid, 'MEMBER')),
+  EXISTS (SELECT 1 FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p')
+            AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+            AND n.nspname NOT LIKE 'pg\\_%'
+            AND pg_has_role(current_user, c.relowner, 'MEMBER')),
+  current_setting('row_security')
+"""
+
+
+@final
+class ScopedConnection:
+    """A connection that is inside a scoped transaction, and only that.
+
+    Exposes statement execution and nothing else: no commit, rollback, begin,
+    raw driver access or execution options. Dead once its transaction ends.
+    """
+
+    __slots__ = ("_conn", "_open", "_scope")
+
+    def __init__(self, conn: AsyncConnection, scope: TenantScope) -> None:
+        self._conn = conn
+        self._scope = scope
+        self._open = True
+
+    @property
+    def scope(self) -> TenantScope:
+        return self._scope
+
+    def _live(self) -> AsyncConnection:
+        if not self._open:
+            raise ScopeClosedError("scoped connection used after its transaction ended")
+        return self._conn
+
+    async def execute(
+        self,
+        statement: Executable,
+        parameters: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+    ) -> CursorResult[Any]:
+        if not isinstance(statement, Executable):
+            raise TypeError("statement must be a SQLAlchemy Executable; wrap raw SQL in text()")
+        return await self._live().execute(statement, parameters)
+
+    async def scalar(
+        self, statement: Executable, parameters: Mapping[str, Any] | None = None
+    ) -> Any:
+        return (await self.execute(statement, parameters)).scalar()
+
+    def _close(self) -> None:
+        self._open = False
+
+
+class Database:
+    """Owns the connection pool. Hands out scoped transactions, nothing else."""
+
+    __slots__ = ("_engine",)
+
+    def __init__(self, engine: AsyncEngine, *, _token: object = None) -> None:
+        if _token is not _CONSTRUCT:
+            raise TypeError("use Database.create() or Database.from_dsn_file()")
+        self._engine = engine
+
+    @classmethod
+    def create(
+        cls,
+        dsn: str,
+        *,
+        pool_size: int = 5,
+        max_overflow: int = 0,
+        pool_timeout: float = 10.0,
+    ) -> Database:
+        """Build the pool for ``dsn`` (a ``postgresql://`` URL).
+
+        Connections are opened lazily; the role safety check runs on each new
+        physical connection, so a misconfigured role fails the first
+        transaction rather than silently serving unfiltered data.
+        """
+        url = _psycopg_url(dsn)
+        engine = create_async_engine(
+            url,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            pool_pre_ping=True,
+            pool_reset_on_return="rollback",
+            # Server-side prepared statements are bound to a server connection,
+            # which PgBouncer transaction mode swaps between transactions.
+            connect_args={"prepare_threshold": None},
+        )
+        event.listen(engine.sync_engine, "connect", _verify_role_on_connect)
+        event.listen(engine.sync_engine, "before_cursor_execute", _guard_statement)
+        return cls(engine, _token=_CONSTRUCT)
+
+    @classmethod
+    def from_dsn_file(cls, path: Path, **pool: Any) -> Database:
+        """Build from a DSN mounted as a file by the Key Vault CSI driver."""
+        return cls.create(path.read_text(encoding="utf-8").strip(), **pool)
+
+    @asynccontextmanager
+    async def transaction(self, scope: TenantScope) -> AsyncIterator[ScopedConnection]:
+        """Run one transaction under ``scope``. Commits on normal exit, rolls back on error."""
+        if type(scope) is not TenantScope:
+            raise TypeError("transaction() requires a TenantScope")
+        async with self._engine.connect() as conn, conn.begin():
+            await conn.execute(
+                _APPLY_SCOPE,
+                {"tenant_ids": scope.tenant_ids_setting, "role": scope.role.value},
+                execution_options={_INTERNAL: True},
+            )
+            scoped = ScopedConnection(conn, scope)
+            try:
+                yield scoped
+                await _assert_scope_intact(conn, scope)
+            finally:
+                scoped._close()
+
+    async def dispose(self) -> None:
+        await self._engine.dispose()
+
+
+_CONSTRUCT: Final = object()
+
+
+def _psycopg_url(dsn: str) -> URL:
+    url = make_url(dsn)
+    if url.get_backend_name() != "postgresql":
+        raise TenancyError("tenancy supports PostgreSQL only")
+    return url.set(drivername="postgresql+psycopg")
+
+
+async def _assert_scope_intact(conn: AsyncConnection, scope: TenantScope) -> None:
+    row = (await conn.execute(_READ_SCOPE, execution_options={_INTERNAL: True})).one()
+    if (row[0], row[1]) != (scope.tenant_ids_setting, scope.role.value):
+        raise ScopeTamperingError("scope changed during the transaction; rolled back")
+
+
+def _guard_statement(
+    conn: Connection,
+    cursor: Any,
+    statement: str,
+    parameters: Any,
+    context: ExecutionContext | None,
+    executemany: bool,
+) -> None:
+    if context is not None and context.execution_options.get(_INTERNAL):
+        return
+    check_statement(statement)
+
+
+def _verify_role_on_connect(dbapi_connection: DBAPIConnection, record: ConnectionPoolEntry) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute(_ROLE_SAFETY)
+        row = cursor.fetchone()
+    finally:
+        cursor.close()
+    dbapi_connection.rollback()
+    if row is None:
+        raise UnsafeDatabaseRoleError("role safety check returned no row")
+    can_bypass, owns_tables, row_security = row
+    if can_bypass:
+        raise UnsafeDatabaseRoleError("database role is, or can become, superuser or BYPASSRLS")
+    if owns_tables:
+        raise UnsafeDatabaseRoleError("database role owns tables and could disable RLS")
+    if row_security != "on":
+        raise UnsafeDatabaseRoleError("row_security is not on for this connection")
+
+
+__all__ = ["Database", "Result", "ScopedConnection"]

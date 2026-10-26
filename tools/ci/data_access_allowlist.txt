@@ -1,0 +1,8 @@
+# Files permitted to bypass the data-access gate (tools/ci/check_data_access.py).
+#
+# One repo-relative path per line, followed by '#' and a justification. An entry
+# without a justification fails the gate. Every addition needs review from the
+# tenancy owner: each line here is a path that is not protected by the tenancy
+# package's role check, scope handling or statement guard.
+#
+# Intentionally empty.
